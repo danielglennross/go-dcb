@@ -1,7 +1,10 @@
 package main
 
-import "time"
-import "fmt"
+import (
+	"fmt"
+	"reflect"
+	"time"
+)
 
 const (
 	closed State = iota
@@ -21,10 +24,16 @@ type Circuit struct {
 
 // Fire circuit breaker contract
 type Fire interface {
-	Fire(ID string, args ...interface{}) (interface{}, error)
+	Fire(ID string, fn Fn) (interface{}, error)
 }
 
-type handler func() (interface{}, error)
+// Cache cache contract
+type Cache interface {
+	Get(ID string) (*Circuit, error)
+	Set(ID string, circuit *Circuit) error
+}
+
+type handler func(ID string, breaker *CircuitBreaker) (interface{}, error)
 
 type fnResult struct {
 	res interface{}
@@ -34,24 +43,25 @@ type fnResult struct {
 // CircuitBreaker circuit breaker
 type CircuitBreaker struct {
 	*Options
-	fn                                               Fn
+	cache                                            Cache
+	fn                                               interface{}
 	ClosedChan, OpenChan, HalfOpenChan, FallbackChan chan string
 }
 
 // Fn function to wrap with breaker
-type Fn func(args ...interface{}) (interface{}, error)
+type Fn func() (interface{}, error)
 
 // Log delegate to log event
 type Log func(message string, context interface{})
 
 // Options circuit breaker options
 type Options struct {
-	GracePeriodMs time.Duration
+	GracePeriodMs int64
 	Threshold     int
 
-	TimeoutMs time.Duration
+	TimeoutMs int64
 
-	BackoffMs time.Duration
+	BackoffMs int64
 	Retry     int
 
 	LogError Log
@@ -59,52 +69,89 @@ type Options struct {
 }
 
 // NewCircuitBreaker create a new circuit breaker
-func NewCircuitBreaker(fn Fn, options *Options) *CircuitBreaker {
+func NewCircuitBreaker(fn interface{}, cache Cache, options *Options) *CircuitBreaker {
 	cb := new(CircuitBreaker)
-	cb.Options = options
 	cb.fn = fn
+	cb.Options = options
+	cb.cache = cache
+	cb.ClosedChan = make(chan string)
+	cb.OpenChan = make(chan string)
+	cb.HalfOpenChan = make(chan string)
+	cb.FallbackChan = make(chan string)
 	return cb
 }
 
 // Destroy disposes of the circuit breaker
 func (breaker *CircuitBreaker) Destroy() {
-	close(breaker.ClosedChan)
-	close(breaker.OpenChan)
-	close(breaker.HalfOpenChan)
-	close(breaker.FallbackChan)
+	breaker.ClosedChan = nil
+	breaker.OpenChan = nil
+	breaker.HalfOpenChan = nil
+	breaker.FallbackChan = nil
 }
 
 // Fire the breaker
 func (breaker *CircuitBreaker) Fire(ID string, args ...interface{}) (interface{}, error) {
-	circuit, err := getOrSetState()
+	circuit, err := breaker.getOrSetState(ID)
 	if err != nil {
 		return nil, err
 	}
 
 	if circuit.State == closed || circuit.State == halfOpen {
-		return breaker.trigger()
+		return breaker.trigger(ID, args)
 	}
 
-	reset, err := breaker.tryReset()
+	reset, err := breaker.tryReset(ID)
 	if err != nil {
 		return nil, err
 	}
 
 	if reset {
-		return breaker.trigger()
+		return breaker.trigger(ID, args)
 	}
 
-	breaker.OpenChan <- ID
+	breaker.FallbackChan <- ID
 	return nil, fmt.Errorf("circuit open for ID: %s", ID)
 }
 
-func getOrSetState() (*Circuit, error) {
-
+func (breaker *CircuitBreaker) getOrSetState(ID string) (*Circuit, error) {
+	circuit, err := breaker.cache.Get(ID)
+	if err != nil {
+		return nil, err
+	}
+	if circuit == nil {
+		circuit = &Circuit{
+			State:    closed,
+			OpenedAt: time.Time{},
+			Failures: 0,
+		}
+		breaker.cache.Set(ID, circuit)
+	}
+	return circuit, nil
 }
 
-func (breaker *CircuitBreaker) trigger() (interface{}, error) {
+func (breaker *CircuitBreaker) trigger(ID string, args []interface{}) (interface{}, error) {
 	getTimout := func() <-chan time.Time {
-		return time.After(time.Millisecond * breaker.TimeoutMs)
+		return time.After(time.Millisecond * time.Duration(breaker.TimeoutMs))
+	}
+
+	makeFn := func() (interface{}, error) {
+		var arr []reflect.Value
+		for _, v := range args {
+			arr = append(arr, reflect.ValueOf(v))
+		}
+
+		result := reflect.ValueOf(breaker.fn).Call(arr)
+		r := result[0].Interface()
+		if r != nil {
+			return r, nil
+		}
+
+		e := result[1].Interface()
+		if e != nil {
+			return nil, e.(error)
+		}
+
+		return nil, fmt.Errorf("Could not execute fn with args %v", args)
 	}
 
 	var handler handler
@@ -119,7 +166,7 @@ func (breaker *CircuitBreaker) trigger() (interface{}, error) {
 			if tryCounter == 0 {
 				start = time.After(0)
 			} else {
-				start = time.After(time.Millisecond * breaker.BackoffMs)
+				start = time.After(time.Millisecond * time.Duration(breaker.BackoffMs))
 			}
 		}
 
@@ -135,7 +182,7 @@ func (breaker *CircuitBreaker) trigger() (interface{}, error) {
 			result = make(chan fnResult, 1)
 
 			go func() {
-				res, err := breaker.fn()
+				res, err := makeFn()
 				result <- fnResult{res, err}
 			}()
 		case value := <-result:
@@ -145,19 +192,82 @@ func (breaker *CircuitBreaker) trigger() (interface{}, error) {
 	}
 
 HANDLE:
-	return handler()
+	return handler(ID, breaker)
 }
 
-func handleFail(err error) func() (interface{}, error) {
-	return func() (interface{}, error) {
-		return nil, nil
+func handleFail(err error) func(string, *CircuitBreaker) (interface{}, error) {
+	return func(ID string, breaker *CircuitBreaker) (interface{}, error) {
+		circuit, cacheErr := breaker.cache.Get(ID)
+		if cacheErr != nil {
+			return nil, cacheErr
+		}
+		if circuit == nil {
+			return nil, err
+		}
+		if circuit.State == open {
+			return nil, err
+		}
+
+		circuit.Failures++
+
+		if circuit.Failures > breaker.Threshold {
+			circuit.State = open
+			circuit.OpenedAt = time.Now()
+
+			breaker.OpenChan <- ID
+		}
+
+		breaker.FallbackChan <- ID
+
+		breaker.cache.Set(ID, circuit)
+
+		return nil, err
 	}
 }
 
-func handleSuccess(value fnResult) func() (interface{}, error) {
-	return func() (interface{}, error) {
-		return nil, nil
+func handleSuccess(value fnResult) func(string, *CircuitBreaker) (interface{}, error) {
+	return func(ID string, breaker *CircuitBreaker) (interface{}, error) {
+		circuit, err := breaker.cache.Get(ID)
+		if err != nil {
+			return nil, err
+		}
+		if circuit == nil {
+			return value.res, value.err
+		}
+		if circuit.State == closed {
+			return value.res, value.err
+		}
+
+		circuit.State = closed
+		circuit.Failures = 0
+
+		breaker.cache.Set(ID, circuit)
+
+		breaker.ClosedChan <- ID
+
+		return value.res, value.err
 	}
 }
 
-func (breaker *CircuitBreaker) tryReset() (bool, error)
+func (breaker *CircuitBreaker) tryReset(ID string) (bool, error) {
+	circuit, err := breaker.cache.Get(ID)
+	if err != nil {
+		return true, err
+	}
+	if circuit == nil {
+		return true, nil
+	}
+
+	moveToHalfOpen := circuit.State == open &&
+		float64((time.Now().Sub(circuit.OpenedAt)).Nanoseconds())*float64(1e-06) > float64(breaker.GracePeriodMs)
+
+	if moveToHalfOpen {
+		circuit.State = halfOpen
+
+		breaker.cache.Set(ID, circuit)
+
+		breaker.HalfOpenChan <- ID
+	}
+
+	return false, nil
+}
