@@ -1,8 +1,11 @@
 package main
 
+import "sync"
+
 // MemoryCache default memory cache
 type MemoryCache struct {
 	lookup map[string]*Circuit
+	mutex  sync.Mutex
 }
 
 // NewMemoryCache ctor
@@ -22,4 +25,11 @@ func (cache *MemoryCache) Get(ID string) (*Circuit, error) {
 func (cache *MemoryCache) Set(ID string, circuit *Circuit) error {
 	cache.lookup[ID] = circuit
 	return nil
+}
+
+// RunCritical run critical section
+func (cache *MemoryCache) RunCritical(ID string, fn func() (interface{}, error)) (interface{}, error) {
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+	return fn()
 }

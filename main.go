@@ -5,7 +5,7 @@ import (
 )
 
 func main() {
-	fn := func(id string, fh int) (interface{}, error) {
+	fn := func(id string, fh int) (int, error) {
 		fmt.Println("Hello World " + id)
 		return 5 * fh, nil
 	}
@@ -18,7 +18,7 @@ func main() {
 		Retry:         3,
 	}
 
-	breaker := NewCircuitBreaker(fn, cache, options)
+	breaker, err := NewCircuitBreaker(fn, cache, cache, options)
 	go func() {
 		for {
 			select {
