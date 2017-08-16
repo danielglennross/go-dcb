@@ -9,7 +9,29 @@ func main() {
 		fmt.Println("Hello World " + id)
 		return 5 * fh, nil
 	}
-	cache := NewMemoryCache()
+	//cache := NewMemoryCache()
+	cache := NewReditCache(&ReditCacheOptions{
+		ReditClientOptions: &ReditClientOptions{
+			Address:  "localhost:6379",
+			Password: "",
+			DB:       0,
+		},
+		TTL: 1000 * 100,
+	})
+	lock := NewRedLock(&RedLockOptions{
+		commonRedLockOptions: commonRedLockOptions{
+			RetryCount:  3,
+			DriftFactor: 300,
+			TTL:         1000 * 100,
+		},
+		clientOptions: []*ReditClientOptions{
+			&ReditClientOptions{
+				Address:  "localhost:6379",
+				Password: "",
+				DB:       0,
+			},
+		},
+	})
 	options := &Options{
 		GracePeriodMs: 500,
 		Threshold:     1,
@@ -18,7 +40,7 @@ func main() {
 		Retry:         3,
 	}
 
-	breaker, err := NewCircuitBreaker(fn, cache, cache, options)
+	breaker, err := NewCircuitBreaker(fn, cache, lock, options)
 	go func() {
 		for {
 			select {

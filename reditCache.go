@@ -3,36 +3,58 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/go-redis/redis"
 )
 
-// ReditCacheOptions cache options
-type ReditCacheOptions struct {
+const (
+	lockScript   = `return redis.call("set", KEYS[1], ARGV[1], "NX", "PX", ARGV[2])`
+	unlockScript = `
+	if redis.call("get", KEYS[1]) == ARGV[1] then
+		return redis.call("del", KEYS[1])
+	else
+		return 0
+	end
+	`
+)
+
+// ReditClientOptions client options
+type ReditClientOptions struct {
 	Address  string
 	Password string
 	DB       int
 }
 
+// ReditCacheOptions cache options
+type ReditCacheOptions struct {
+	*ReditClientOptions
+
+	LogError Log
+	LogInfo  Log
+	TTL      int
+}
+
 // ReditCache default memory cache
 type ReditCache struct {
+	*ReditCacheOptions
 	client *redis.Client
-	ttl    int
 }
 
 type commonRedLockOptions struct {
-	retryCount  int
-	retrydelay  int
-	driftFactor float64
-	ttl         int
+	RetryCount  int
+	DriftFactor float64
+	TTL         int
+	LogError    Log
+	LogInfo     Log
 }
 
 // RedLockOptions red lock options
 type RedLockOptions struct {
 	commonRedLockOptions
-	clientOptions []ReditCacheOptions
+	clientOptions []*ReditClientOptions
 }
 
 // RedLock redis lock
@@ -50,12 +72,18 @@ type RedLock struct {
 // NewReditCache ctor
 func NewReditCache(options *ReditCacheOptions) *ReditCache {
 	cache := new(ReditCache)
-	cache.ttl = 0
+	cache.ReditClientOptions = options.ReditClientOptions
 	cache.client = redis.NewClient(&redis.Options{
 		Addr:     options.Address,
 		Password: options.Password,
 		DB:       options.DB,
 	})
+	if options.LogError == nil {
+		cache.LogError = func(message string, context interface{}) {}
+	}
+	if options.LogInfo == nil {
+		cache.LogInfo = func(message string, context interface{}) {}
+	}
 	return cache
 }
 
@@ -80,11 +108,11 @@ func NewRedLock(options *RedLockOptions) *RedLock {
 // Get gets item from cache
 func (cache *ReditCache) Get(ID string) (*Circuit, error) {
 	val, err := cache.client.Get(ID).Result()
-	if err != nil {
-		return nil, err
-	}
 	if err == redis.Nil {
 		return nil, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	res := &Circuit{}
@@ -98,7 +126,7 @@ func (cache *ReditCache) Set(ID string, circuit *Circuit) error {
 	if err != nil {
 		return err
 	}
-	ttl := time.Millisecond * time.Duration(cache.ttl)
+	ttl := time.Millisecond * time.Duration(cache.TTL)
 	return cache.client.Set(ID, cir, ttl).Err()
 }
 
@@ -111,30 +139,32 @@ func (rl *RedLock) RunCritical(ID string, fn func() (interface{}, error)) (inter
 
 func (rl *RedLock) lock(ID string) error {
 	lockInstance := func(client *redis.Client, ID string, ttl int, c chan bool) {
-		_, err := client.Eval("SET KEYS[1] ARGV[1] NX PX ARGV[2]", []string{ID}, ID, ttl).Result()
-		c <- err != nil
+		_, err := client.Eval(lockScript, []string{ID}, ID, strconv.Itoa(ttl)).Result()
+		c <- err == nil
 	}
 
-	for i := 0; i < rl.retryCount; i++ {
-		ttl := rl.ttl
+	for i := 0; i < rl.RetryCount; i++ {
+		ttl := rl.TTL
 		success := 0
-		start := time.Now().UnixNano()
+		//start := time.Now().UnixNano()
 
 		c := make(chan bool, len(rl.clients))
 		for _, client := range rl.clients {
 			go lockInstance(client, ID, ttl, c)
 		}
-		for e := range c {
-			if e {
+		for j := 0; j < len(rl.clients); j++ {
+			if <-c {
 				success++
 			}
 		}
+		close(c)
 
-		drift := int(float64(ttl)*rl.driftFactor) + 2
-		costTime := (time.Now().UnixNano() - start) / 1e6
-		validityTime := int64(ttl) - costTime - int64(drift)
+		//drift := int(float64(ttl)*rl.driftFactor) + 2
+		//costTime := (time.Now().UnixNano() - start) / 1e6
+		//validityTime := int64(ttl) - costTime - int64(drift)
 
-		if success >= (len(rl.clients)/2)+1 && validityTime > 0 {
+		quorum := (len(rl.clients) / 2) + 1
+		if success >= quorum /*&& validityTime > 0*/ {
 			return nil
 		}
 
@@ -151,17 +181,13 @@ func (rl *RedLock) unlock(ID string) {
 	unlockInstance := func(client *redis.Client, ID string) {
 		defer wg.Done()
 
-		client.Eval(`
-			if redis.call("get", KEYS[1]) == ARGV[1] then
-					return redis.call("del", KEYS[1])
-			else
-					return 0
-			end`,
-			[]string{ID}, ID).Result()
+		_, err := client.Eval(unlockScript, []string{ID}, ID).Result()
+
+		rl.LogError(fmt.Sprintf("Could not unlock ID %s", ID), err)
 	}
 
+	wg.Add(len(rl.clients))
 	for _, client := range rl.clients {
-		wg.Add(1)
 		go unlockInstance(client, ID)
 	}
 

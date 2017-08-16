@@ -144,7 +144,10 @@ func (breaker *CircuitBreaker) getOrSetState(ID string) (*Circuit, error) {
 				OpenedAt: time.Time{},
 				Failures: 0,
 			}
-			breaker.cache.Set(ID, circuit)
+			err := breaker.cache.Set(ID, circuit)
+			if err != nil {
+				return nil, err
+			}
 		}
 		return circuit, nil
 	})
