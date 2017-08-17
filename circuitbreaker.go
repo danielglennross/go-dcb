@@ -4,38 +4,13 @@ import (
 	"fmt"
 	"reflect"
 	"time"
+
+	"github.com/danielglennross/go-dcb/schema"
 )
-
-const (
-	closed State = iota
-	open
-	halfOpen
-)
-
-// State circuit state
-type State int
-
-// Circuit distributed circuit
-type Circuit struct {
-	State    State
-	Failures int
-	OpenedAt time.Time
-}
 
 // Fire circuit breaker contract
 type Fire interface {
 	Fire(ID string, fn interface{}) (interface{}, error)
-}
-
-// Cache cache contract
-type Cache interface {
-	Get(ID string) (*Circuit, error)
-	Set(ID string, circuit *Circuit) error
-}
-
-// DistLock distributed lock
-type DistLock interface {
-	RunCritical(ID string, fn func() (interface{}, error)) (interface{}, error)
 }
 
 type handler func(ID string, breaker *CircuitBreaker) (interface{}, error)
@@ -49,13 +24,10 @@ type fnResult struct {
 type CircuitBreaker struct {
 	*Options
 	ClosedChan, OpenChan, HalfOpenChan, FallbackChan chan string
-	cache                                            Cache
-	lock                                             DistLock
+	cache                                            schema.Cache
+	lock                                             schema.DistLock
 	fn                                               interface{}
 }
-
-// Log delegate to log event
-type Log func(message string, context interface{})
 
 // Options circuit breaker options
 type Options struct {
@@ -67,12 +39,12 @@ type Options struct {
 	BackoffMs int64
 	Retry     int
 
-	LogError Log
-	LogInfo  Log
+	LogError schema.Log
+	LogInfo  schema.Log
 }
 
 // NewCircuitBreaker create a new circuit breaker
-func NewCircuitBreaker(fn interface{}, cache Cache, lock DistLock, options *Options) (*CircuitBreaker, error) {
+func NewCircuitBreaker(fn interface{}, cache schema.Cache, lock schema.DistLock, options *Options) (*CircuitBreaker, error) {
 	fnType := reflect.TypeOf(fn)
 
 	if fnType.NumOut() != 2 {
@@ -102,10 +74,10 @@ func NewCircuitBreaker(fn interface{}, cache Cache, lock DistLock, options *Opti
 
 // Destroy disposes of the circuit breaker
 func (breaker *CircuitBreaker) Destroy() {
-	breaker.ClosedChan = nil
-	breaker.OpenChan = nil
-	breaker.HalfOpenChan = nil
-	breaker.FallbackChan = nil
+	close(breaker.ClosedChan)
+	close(breaker.OpenChan)
+	close(breaker.HalfOpenChan)
+	close(breaker.FallbackChan)
 }
 
 // Fire the breaker
@@ -115,7 +87,7 @@ func (breaker *CircuitBreaker) Fire(ID string, args ...interface{}) (interface{}
 		return nil, err
 	}
 
-	if circuit.State == closed || circuit.State == halfOpen {
+	if circuit.State == schema.Closed || circuit.State == schema.HalfOpen {
 		return breaker.trigger(ID, args)
 	}
 
@@ -132,15 +104,15 @@ func (breaker *CircuitBreaker) Fire(ID string, args ...interface{}) (interface{}
 	return nil, fmt.Errorf("circuit open for ID: %s", ID)
 }
 
-func (breaker *CircuitBreaker) getOrSetState(ID string) (*Circuit, error) {
+func (breaker *CircuitBreaker) getOrSetState(ID string) (*schema.Circuit, error) {
 	res, err := breaker.lock.RunCritical(ID, func() (interface{}, error) {
 		circuit, err := breaker.cache.Get(ID)
 		if err != nil {
 			return nil, err
 		}
 		if circuit == nil {
-			circuit = &Circuit{
-				State:    closed,
+			circuit = &schema.Circuit{
+				State:    schema.Closed,
 				OpenedAt: time.Time{},
 				Failures: 0,
 			}
@@ -151,7 +123,7 @@ func (breaker *CircuitBreaker) getOrSetState(ID string) (*Circuit, error) {
 		}
 		return circuit, nil
 	})
-	return res.(*Circuit), err
+	return res.(*schema.Circuit), err
 }
 
 func (breaker *CircuitBreaker) trigger(ID string, args []interface{}) (interface{}, error) {
@@ -230,14 +202,14 @@ func handleFail(err error) func(string, *CircuitBreaker) (interface{}, error) {
 			if circuit == nil {
 				return nil, err
 			}
-			if circuit.State == open {
+			if circuit.State == schema.Open {
 				return nil, err
 			}
 
 			circuit.Failures++
 
 			if circuit.Failures > breaker.Threshold {
-				circuit.State = open
+				circuit.State = schema.Open
 				circuit.OpenedAt = time.Now()
 
 				breaker.OpenChan <- ID
@@ -262,11 +234,11 @@ func handleSuccess(value fnResult) func(string, *CircuitBreaker) (interface{}, e
 			if circuit == nil {
 				return value.res, value.err
 			}
-			if circuit.State == closed {
+			if circuit.State == schema.Closed {
 				return value.res, value.err
 			}
 
-			circuit.State = closed
+			circuit.State = schema.Closed
 			circuit.Failures = 0
 
 			breaker.cache.Set(ID, circuit)
@@ -288,11 +260,11 @@ func (breaker *CircuitBreaker) tryReset(ID string) (bool, error) {
 			return true, nil
 		}
 
-		moveToHalfOpen := circuit.State == open &&
+		moveToHalfOpen := circuit.State == schema.Open &&
 			float64((time.Now().Sub(circuit.OpenedAt)).Nanoseconds())*float64(1e-06) > float64(breaker.GracePeriodMs)
 
 		if moveToHalfOpen {
-			circuit.State = halfOpen
+			circuit.State = schema.HalfOpen
 
 			breaker.cache.Set(ID, circuit)
 

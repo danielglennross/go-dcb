@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+
+	c "github.com/danielglennross/go-dcb/cache"
 )
 
 func main() {
@@ -10,22 +12,23 @@ func main() {
 		return 5 * fh, nil
 	}
 	//cache := NewMemoryCache()
-	cache := NewReditCache(&ReditCacheOptions{
-		ReditClientOptions: &ReditClientOptions{
+	cache := c.NewReditCache(&c.ReditCacheOptions{
+		ReditClientOptions: &c.ReditClientOptions{
 			Address:  "localhost:6379",
 			Password: "",
 			DB:       0,
 		},
 		TTL: 1000 * 100,
 	})
-	lock := NewRedLock(&RedLockOptions{
-		commonRedLockOptions: commonRedLockOptions{
-			RetryCount:  3,
-			DriftFactor: 300,
-			TTL:         1000 * 100,
+	lock := c.NewRedLock(&c.RedLockOptions{
+		CommonRedLockOptions: c.CommonRedLockOptions{
+			RetryCount:   3,
+			RetryDelayMs: 300,
+			DriftFactor:  0.01,
+			TTLms:        1000 * 100,
 		},
-		clientOptions: []*ReditClientOptions{
-			&ReditClientOptions{
+		ClientOptions: []*c.ReditClientOptions{
+			&c.ReditClientOptions{
 				Address:  "localhost:6379",
 				Password: "",
 				DB:       0,
@@ -35,7 +38,7 @@ func main() {
 	options := &Options{
 		GracePeriodMs: 500,
 		Threshold:     1,
-		TimeoutMs:     100,
+		TimeoutMs:     1,
 		BackoffMs:     1000,
 		Retry:         3,
 	}
@@ -44,13 +47,25 @@ func main() {
 	go func() {
 		for {
 			select {
-			case o := <-breaker.OpenChan:
+			case o, ok := <-breaker.OpenChan:
+				if !ok {
+					return
+				}
 				fmt.Printf("%s", o)
-			case c := <-breaker.ClosedChan:
+			case c, ok := <-breaker.ClosedChan:
+				if !ok {
+					return
+				}
 				fmt.Printf("%s", c)
-			case ho := <-breaker.HalfOpenChan:
+			case ho, ok := <-breaker.HalfOpenChan:
+				if !ok {
+					return
+				}
 				fmt.Printf("%s", ho)
-			case f := <-breaker.FallbackChan:
+			case f, ok := <-breaker.FallbackChan:
+				if !ok {
+					return
+				}
 				fmt.Printf("%s", f)
 			}
 		}
