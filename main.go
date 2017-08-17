@@ -11,7 +11,9 @@ func main() {
 		fmt.Println("Hello World " + id)
 		return 5 * fh, nil
 	}
-	//cache := NewMemoryCache()
+
+	// cache := cache.NewMemoryCache()
+
 	cache := c.NewReditCache(&c.ReditCacheOptions{
 		ReditClientOptions: &c.ReditClientOptions{
 			Address:  "localhost:6379",
@@ -35,6 +37,7 @@ func main() {
 			},
 		},
 	})
+
 	options := &Options{
 		GracePeriodMs: 500,
 		Threshold:     1,
@@ -44,32 +47,14 @@ func main() {
 	}
 
 	breaker, err := NewCircuitBreaker(fn, cache, lock, options)
-	go func() {
-		for {
-			select {
-			case o, ok := <-breaker.OpenChan:
-				if !ok {
-					return
-				}
-				fmt.Printf("%s", o)
-			case c, ok := <-breaker.ClosedChan:
-				if !ok {
-					return
-				}
-				fmt.Printf("%s", c)
-			case ho, ok := <-breaker.HalfOpenChan:
-				if !ok {
-					return
-				}
-				fmt.Printf("%s", ho)
-			case f, ok := <-breaker.FallbackChan:
-				if !ok {
-					return
-				}
-				fmt.Printf("%s", f)
-			}
-		}
-	}()
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	breaker.OnClosed(func(ID string) { fmt.Printf("%s", ID) })
+	breaker.OnFallback(func(ID string) { fmt.Printf("%s", ID) })
+	breaker.OnOpen(func(ID string) { fmt.Printf("%s", ID) })
+	breaker.OnHalfOpen(func(ID string) { fmt.Printf("%s", ID) })
 
 	res, err := breaker.Fire("myFn", "daniel", 2)
 	if err != nil {

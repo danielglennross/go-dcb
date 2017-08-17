@@ -15,18 +15,33 @@ type Fire interface {
 
 type handler func(ID string, breaker *CircuitBreaker) (interface{}, error)
 
+type eventHandler func(ID string)
+
 type fnResult struct {
 	res interface{}
+	err error
+}
+
+type circuitChan struct {
+	ID    string
+	state schema.State
+}
+
+type fallbackChan struct {
+	ID  string
 	err error
 }
 
 // CircuitBreaker circuit breaker
 type CircuitBreaker struct {
 	*Options
-	ClosedChan, OpenChan, HalfOpenChan, FallbackChan chan string
-	cache                                            schema.Cache
-	lock                                             schema.DistLock
-	fn                                               interface{}
+	circuitChan                      chan circuitChan
+	fallbackChan                     chan fallbackChan
+	closed, open, halfOpen, fallback eventHandler
+	exit                             chan bool
+	cache                            schema.Cache
+	lock                             schema.DistLock
+	fn                               interface{}
 }
 
 // Options circuit breaker options
@@ -65,19 +80,71 @@ func NewCircuitBreaker(fn interface{}, cache schema.Cache, lock schema.DistLock,
 	cb.Options = options
 	cb.cache = cache
 	cb.lock = lock
-	cb.ClosedChan = make(chan string)
-	cb.OpenChan = make(chan string)
-	cb.HalfOpenChan = make(chan string)
-	cb.FallbackChan = make(chan string)
+
+	cb.circuitChan = make(chan circuitChan)
+	cb.fallbackChan = make(chan fallbackChan)
+	cb.exit = make(chan bool)
+
+	nullEventHandler := func(ID string) {}
+	cb.open = nullEventHandler
+	cb.halfOpen = nullEventHandler
+	cb.closed = nullEventHandler
+	cb.fallback = nullEventHandler
+
+	go handleEvents(cb)
+
 	return cb, nil
 }
 
 // Destroy disposes of the circuit breaker
 func (breaker *CircuitBreaker) Destroy() {
-	close(breaker.ClosedChan)
-	close(breaker.OpenChan)
-	close(breaker.HalfOpenChan)
-	close(breaker.FallbackChan)
+	close(breaker.exit) // kill go routine
+	close(breaker.circuitChan)
+	close(breaker.fallbackChan)
+}
+
+func handleEvents(breaker *CircuitBreaker) {
+	for {
+		select {
+		case <-breaker.exit:
+			return
+		case f := <-breaker.fallbackChan:
+			breaker.fallback(f.ID)
+		case c := <-breaker.circuitChan:
+			switch c.state {
+			case schema.Closed:
+				breaker.closed(c.ID)
+			case schema.Open:
+				breaker.open(c.ID)
+			case schema.HalfOpen:
+				breaker.halfOpen(c.ID)
+			}
+		}
+	}
+}
+
+// OnClosed handle on closed
+func (breaker *CircuitBreaker) OnClosed(closed eventHandler) *CircuitBreaker {
+	breaker.closed = closed
+	return breaker
+}
+
+// OnOpen handle on opened
+func (breaker *CircuitBreaker) OnOpen(open eventHandler) *CircuitBreaker {
+	breaker.open = open
+	return breaker
+}
+
+// OnHalfOpen handle on half opened
+func (breaker *CircuitBreaker) OnHalfOpen(halfOpen eventHandler) *CircuitBreaker {
+	breaker.halfOpen = halfOpen
+	return breaker
+}
+
+// OnFallback handle fallack
+func (breaker *CircuitBreaker) OnFallback(fallback eventHandler) *CircuitBreaker {
+	breaker.fallback = fallback
+	return breaker
 }
 
 // Fire the breaker
@@ -100,8 +167,9 @@ func (breaker *CircuitBreaker) Fire(ID string, args ...interface{}) (interface{}
 		return breaker.trigger(ID, args)
 	}
 
-	breaker.FallbackChan <- ID
-	return nil, fmt.Errorf("circuit open for ID: %s", ID)
+	err = fmt.Errorf("circuit open for ID: %s", ID)
+	breaker.fallbackChan <- fallbackChan{ID, err}
+	return nil, err
 }
 
 func (breaker *CircuitBreaker) getOrSetState(ID string) (*schema.Circuit, error) {
@@ -123,7 +191,10 @@ func (breaker *CircuitBreaker) getOrSetState(ID string) (*schema.Circuit, error)
 		}
 		return circuit, nil
 	})
-	return res.(*schema.Circuit), err
+	if err != nil {
+		return nil, err
+	}
+	return res.(*schema.Circuit), nil
 }
 
 func (breaker *CircuitBreaker) trigger(ID string, args []interface{}) (interface{}, error) {
@@ -212,10 +283,10 @@ func handleFail(err error) func(string, *CircuitBreaker) (interface{}, error) {
 				circuit.State = schema.Open
 				circuit.OpenedAt = time.Now()
 
-				breaker.OpenChan <- ID
+				breaker.circuitChan <- circuitChan{ID, schema.Open}
 			}
 
-			breaker.FallbackChan <- ID
+			breaker.fallbackChan <- fallbackChan{ID, err}
 
 			breaker.cache.Set(ID, circuit)
 
@@ -228,6 +299,7 @@ func handleSuccess(value fnResult) func(string, *CircuitBreaker) (interface{}, e
 	return func(ID string, breaker *CircuitBreaker) (interface{}, error) {
 		return breaker.lock.RunCritical(ID, func() (interface{}, error) {
 			circuit, err := breaker.cache.Get(ID)
+
 			if err != nil {
 				return nil, err
 			}
@@ -243,7 +315,7 @@ func handleSuccess(value fnResult) func(string, *CircuitBreaker) (interface{}, e
 
 			breaker.cache.Set(ID, circuit)
 
-			breaker.ClosedChan <- ID
+			breaker.circuitChan <- circuitChan{ID, schema.Closed}
 
 			return value.res, value.err
 		})
@@ -268,7 +340,7 @@ func (breaker *CircuitBreaker) tryReset(ID string) (bool, error) {
 
 			breaker.cache.Set(ID, circuit)
 
-			breaker.HalfOpenChan <- ID
+			breaker.circuitChan <- circuitChan{ID, schema.HalfOpen}
 		}
 
 		return false, nil
