@@ -22,123 +22,145 @@ const (
 	`
 )
 
-// ReditClientOptions client options
-type ReditClientOptions struct {
+// ReditCache default memory cache
+type ReditCache struct {
+	logError schema.Log
+	logInfo  schema.Log
+	ttl      int
+	client   *redis.Client
+}
+
+// RedLock redis lock
+type RedLock struct {
+	retryCount   int
+	retryDelayMs int
+	driftFactor  float64
+	ttlMs        int
+	logError     schema.Log
+	logInfo      schema.Log
+	clients      []*redis.Client
+}
+
+type redLockOption func(*RedLock)
+
+// ClientOption redis client option
+type ClientOption struct {
 	Address  string
 	Password string
 	DB       int
 }
 
-// ReditCacheOptions cache options
-type ReditCacheOptions struct {
-	*ReditClientOptions
-
-	LogError schema.Log
-	LogInfo  schema.Log
-	TTL      int
+// RetryCount rery count
+func RetryCount(r int) redLockOption {
+	return func(rc *RedLock) {
+		rc.retryCount = r
+	}
 }
 
-// ReditCache default memory cache
-type ReditCache struct {
-	*ReditCacheOptions
-	client *redis.Client
+// RetryDelayMs in milliseconds
+func RetryDelayMs(r int) redLockOption {
+	return func(rc *RedLock) {
+		rc.retryDelayMs = r
+	}
 }
 
-// CommonRedLockOptions common lock options
-type CommonRedLockOptions struct {
-	RetryCount   int
-	RetryDelayMs int
-	DriftFactor  float64
-	TTLms        int
-	LogError     schema.Log
-	LogInfo      schema.Log
+// DriftFactor drift factor
+func DriftFactor(df float64) redLockOption {
+	return func(rc *RedLock) {
+		rc.driftFactor = df
+	}
 }
 
-// RedLockOptions red lock options
-type RedLockOptions struct {
-	CommonRedLockOptions
-	ClientOptions []*ReditClientOptions
+// TTLms to live in milliseconds
+func TTLms(ttlMs int) redLockOption {
+	return func(rc *RedLock) {
+		rc.ttlMs = ttlMs
+	}
 }
 
-// RedLock redis lock
-type RedLock struct {
-	CommonRedLockOptions
+// RedLockLogError log error delegate
+func RedLockLogError(le schema.Log) redLockOption {
+	return func(rc *RedLock) {
+		rc.logError = le
+	}
+}
 
-	clients []*redis.Client
-	quorum  int
+// RedLockLogInfo log info delegate
+func RedLockLogInfo(li schema.Log) redLockOption {
+	return func(rc *RedLock) {
+		rc.logInfo = li
+	}
+}
 
-	resource string
-	val      string
-	expiry   int64
+type reditCacheOption func(*ReditCache)
+
+// TTL time to live in milliseconds
+func TTL(ttl int) reditCacheOption {
+	return func(rc *ReditCache) {
+		rc.ttl = ttl
+	}
+}
+
+// CacheLogError log error delegate
+func CacheLogError(le schema.Log) reditCacheOption {
+	return func(rc *ReditCache) {
+		rc.logError = le
+	}
+}
+
+// CacheLogInfo log info delegate
+func CacheLogInfo(li schema.Log) reditCacheOption {
+	return func(rc *ReditCache) {
+		rc.logInfo = li
+	}
 }
 
 // NewReditCache ctor
-func NewReditCache(options *ReditCacheOptions) *ReditCache {
+func NewReditCache(client ClientOption, options ...reditCacheOption) *ReditCache {
 	cache := new(ReditCache)
-	cache.ReditCacheOptions = &ReditCacheOptions{
-		ReditClientOptions: &ReditClientOptions{
-			Address:  options.ReditClientOptions.Address,
-			Password: options.ReditClientOptions.Password,
-			DB:       options.ReditClientOptions.DB,
-		},
-	}
-	cache.TTL = options.TTL
-	cache.LogError = options.LogError
-	cache.LogInfo = options.LogInfo
-
 	cache.client = redis.NewClient(&redis.Options{
-		Addr:     options.Address,
-		Password: options.Password,
-		DB:       options.DB,
+		Addr:     client.Address,
+		Password: client.Password,
+		DB:       client.DB,
 	})
 
-	if cache.TTL == 0 {
-		cache.TTL = 500
-	}
-	if cache.LogError == nil {
-		cache.LogError = func(message string, context interface{}) {}
-	}
-	if cache.LogInfo == nil {
-		cache.LogInfo = func(message string, context interface{}) {}
+	cache.ttl = 500
+	cache.logError = func(message string, context interface{}) {}
+	cache.logInfo = func(message string, context interface{}) {}
+
+	for _, opt := range options {
+		opt(cache)
 	}
 
 	return cache
 }
 
 // NewRedLock create new red lock
-func NewRedLock(options *RedLockOptions) *RedLock {
-	clients := []*redis.Client{}
-	for _, co := range options.ClientOptions {
+func NewRedLock(clients []ClientOption, options ...redLockOption) *RedLock {
+	rl := new(RedLock)
+
+	cls := []*redis.Client{}
+	for _, co := range clients {
 		c := redis.NewClient(&redis.Options{
 			Addr:     co.Address,
 			Password: co.Password,
 			DB:       co.DB,
 		})
-		clients = append(clients, c)
+		cls = append(cls, c)
+	}
+	rl.clients = cls
+
+	rl.retryDelayMs = 300
+	rl.retryDelayMs = 3
+	rl.driftFactor = 0.01
+	rl.ttlMs = 500
+	rl.logError = func(message string, context interface{}) {}
+	rl.logInfo = func(message string, context interface{}) {}
+
+	for _, opt := range options {
+		opt(rl)
 	}
 
-	rl := new(RedLock)
-	rl.clients = clients
-	rl.CommonRedLockOptions = options.CommonRedLockOptions
-
-	if rl.RetryDelayMs == 0 {
-		rl.RetryDelayMs = 300
-	}
-	if rl.RetryCount == 0 {
-		rl.RetryDelayMs = 3
-	}
-	if rl.DriftFactor == 0 {
-		rl.DriftFactor = 0.01
-	}
-	if rl.TTLms == 0 {
-		rl.TTLms = 500
-	}
-	if rl.LogError == nil {
-		rl.LogError = func(message string, context interface{}) {}
-	}
-	if rl.LogInfo == nil {
-		rl.LogInfo = func(message string, context interface{}) {}
-	}
 	return rl
 }
 
@@ -163,7 +185,7 @@ func (cache *ReditCache) Set(ID string, circuit *schema.Circuit) error {
 	if err != nil {
 		return err
 	}
-	ttl := time.Millisecond * time.Duration(cache.TTL)
+	ttl := time.Millisecond * time.Duration(cache.ttl)
 	return cache.client.Set(ID, cir, ttl).Err()
 }
 
@@ -180,8 +202,8 @@ func (rl *RedLock) lock(ID string) error {
 		c <- err == nil
 	}
 
-	for i := 0; i < rl.RetryCount; i++ {
-		ttlMs := rl.TTLms
+	for i := 0; i < rl.retryCount; i++ {
+		ttlMs := rl.ttlMs
 		success := 0
 		startNs := time.Now().UnixNano()
 
@@ -196,7 +218,7 @@ func (rl *RedLock) lock(ID string) error {
 		}
 		close(c)
 
-		driftMs := int(float64(ttlMs)*rl.DriftFactor) + 2
+		driftMs := int(float64(ttlMs)*rl.driftFactor) + 2
 		costTimeMs := (time.Now().UnixNano() - startNs) / 1e6
 		validityTime := int64(ttlMs) - costTimeMs - int64(driftMs)
 
@@ -206,7 +228,7 @@ func (rl *RedLock) lock(ID string) error {
 		}
 
 		rl.unlock(ID)
-		time.Sleep(time.Duration(rl.RetryDelayMs) * time.Millisecond)
+		time.Sleep(time.Duration(rl.retryDelayMs) * time.Millisecond)
 	}
 
 	return fmt.Errorf("Failed to lock for %s", ID)
@@ -220,7 +242,7 @@ func (rl *RedLock) unlock(ID string) {
 
 		_, err := client.Eval(unlockScript, []string{ID}, ID).Result()
 
-		rl.LogError(fmt.Sprintf("Could not unlock ID %s", ID), err)
+		rl.logError(fmt.Sprintf("Could not unlock ID %s", ID), err)
 	}
 
 	wg.Add(len(rl.clients))

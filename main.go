@@ -14,39 +14,40 @@ func main() {
 
 	// cache := cache.NewMemoryCache()
 
-	cache := c.NewReditCache(&c.ReditCacheOptions{
-		ReditClientOptions: &c.ReditClientOptions{
+	cache := c.NewReditCache(
+		c.ClientOption{
 			Address:  "localhost:6379",
 			Password: "",
 			DB:       0,
 		},
-		TTL: 1000 * 100,
-	})
-	lock := c.NewRedLock(&c.RedLockOptions{
-		CommonRedLockOptions: c.CommonRedLockOptions{
-			RetryCount:   3,
-			RetryDelayMs: 300,
-			DriftFactor:  0.01,
-			TTLms:        1000 * 100,
-		},
-		ClientOptions: []*c.ReditClientOptions{
-			&c.ReditClientOptions{
+		c.TTL(1000*100),
+	)
+
+	lock := c.NewRedLock(
+		[]c.ClientOption{
+			c.ClientOption{
 				Address:  "localhost:6379",
 				Password: "",
 				DB:       0,
 			},
 		},
-	})
+		c.RetryCount(3),
+		c.RetryDelayMs(300),
+		c.DriftFactor(0.01),
+		c.TTLms(1000*100),
+	)
 
-	options := &Options{
-		GracePeriodMs: 500,
-		Threshold:     1,
-		TimeoutMs:     1,
-		BackoffMs:     1000,
-		Retry:         3,
-	}
+	breaker, err := NewCircuitBreaker(
+		fn,
+		cache,
+		lock,
+		GracePeriodMs(500),
+		Threshold(1),
+		TimeoutMs(1000),
+		BackoffMs(100),
+		Retry(3),
+	)
 
-	breaker, err := NewCircuitBreaker(fn, cache, lock, options)
 	if err != nil {
 		fmt.Println(err)
 	}

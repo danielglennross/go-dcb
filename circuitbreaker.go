@@ -34,7 +34,7 @@ type fallbackChan struct {
 
 // CircuitBreaker circuit breaker
 type CircuitBreaker struct {
-	*Options
+	*options
 	circuitChan                      chan circuitChan
 	fallbackChan                     chan fallbackChan
 	closed, open, halfOpen, fallback eventHandler
@@ -45,21 +45,72 @@ type CircuitBreaker struct {
 }
 
 // Options circuit breaker options
-type Options struct {
-	GracePeriodMs int64
-	Threshold     int
+type options struct {
+	gracePeriodMs int64
+	threshold     int
 
-	TimeoutMs int64
+	timeoutMs int64
 
-	BackoffMs int64
-	Retry     int
+	backoffMs int64
+	retry     int
 
-	LogError schema.Log
-	LogInfo  schema.Log
+	logError schema.Log
+	logInfo  schema.Log
+}
+
+type circuitBreakerOption func(*CircuitBreaker)
+
+// GracePeriodMs grace period in milliseconds
+func GracePeriodMs(gp int64) circuitBreakerOption {
+	return func(cb *CircuitBreaker) {
+		cb.gracePeriodMs = gp
+	}
+}
+
+// Threshold threshold (< 1)
+func Threshold(t int) circuitBreakerOption {
+	return func(cb *CircuitBreaker) {
+		cb.threshold = t
+	}
+}
+
+// TimeoutMs in milliseconds
+func TimeoutMs(t int64) circuitBreakerOption {
+	return func(cb *CircuitBreaker) {
+		cb.timeoutMs = t
+	}
+}
+
+// BackoffMs in milliseconds
+func BackoffMs(b int64) circuitBreakerOption {
+	return func(cb *CircuitBreaker) {
+		cb.backoffMs = b
+	}
+}
+
+// Retry count
+func Retry(r int) circuitBreakerOption {
+	return func(cb *CircuitBreaker) {
+		cb.retry = r
+	}
+}
+
+// LogError log error delegate
+func LogError(le schema.Log) circuitBreakerOption {
+	return func(cb *CircuitBreaker) {
+		cb.logError = le
+	}
+}
+
+// LogInfo log info delegate
+func LogInfo(li schema.Log) circuitBreakerOption {
+	return func(cb *CircuitBreaker) {
+		cb.logInfo = li
+	}
 }
 
 // NewCircuitBreaker create a new circuit breaker
-func NewCircuitBreaker(fn interface{}, cache schema.Cache, lock schema.DistLock, options *Options) (*CircuitBreaker, error) {
+func NewCircuitBreaker(fn interface{}, cache schema.Cache, lock schema.DistLock, options ...circuitBreakerOption) (*CircuitBreaker, error) {
 	fnType := reflect.TypeOf(fn)
 
 	if fnType.NumOut() != 2 {
@@ -77,9 +128,14 @@ func NewCircuitBreaker(fn interface{}, cache schema.Cache, lock schema.DistLock,
 
 	cb := new(CircuitBreaker)
 	cb.fn = fn
-	cb.Options = options
 	cb.cache = cache
 	cb.lock = lock
+
+	cb.gracePeriodMs = 500
+	cb.threshold = 1
+	cb.timeoutMs = 3000
+	cb.backoffMs = 1000
+	cb.retry = 3
 
 	cb.circuitChan = make(chan circuitChan)
 	cb.fallbackChan = make(chan fallbackChan)
@@ -90,6 +146,13 @@ func NewCircuitBreaker(fn interface{}, cache schema.Cache, lock schema.DistLock,
 	cb.halfOpen = nullEventHandler
 	cb.closed = nullEventHandler
 	cb.fallback = nullEventHandler
+
+	cb.logError = func(message string, context interface{}) {}
+	cb.logInfo = func(message string, context interface{}) {}
+
+	for _, opt := range options {
+		opt(cb)
+	}
 
 	go handleEvents(cb)
 
@@ -199,7 +262,7 @@ func (breaker *CircuitBreaker) getOrSetState(ID string) (*schema.Circuit, error)
 
 func (breaker *CircuitBreaker) trigger(ID string, args []interface{}) (interface{}, error) {
 	getTimout := func() <-chan time.Time {
-		return time.After(time.Millisecond * time.Duration(breaker.TimeoutMs))
+		return time.After(time.Millisecond * time.Duration(breaker.timeoutMs))
 	}
 
 	makeFn := func() (interface{}, error) {
@@ -229,12 +292,12 @@ func (breaker *CircuitBreaker) trigger(ID string, args []interface{}) (interface
 	var start <-chan time.Time
 	tryCounter := 0
 
-	for tryCounter < breaker.Retry {
+	for tryCounter < breaker.retry {
 		if result == nil {
 			if tryCounter == 0 {
 				start = time.After(0)
 			} else {
-				start = time.After(time.Millisecond * time.Duration(breaker.BackoffMs))
+				start = time.After(time.Millisecond * time.Duration(breaker.backoffMs))
 			}
 		}
 
@@ -279,7 +342,7 @@ func handleFail(err error) func(string, *CircuitBreaker) (interface{}, error) {
 
 			circuit.Failures++
 
-			if circuit.Failures > breaker.Threshold {
+			if circuit.Failures > breaker.threshold {
 				circuit.State = schema.Open
 				circuit.OpenedAt = time.Now()
 
@@ -333,7 +396,7 @@ func (breaker *CircuitBreaker) tryReset(ID string) (bool, error) {
 		}
 
 		moveToHalfOpen := circuit.State == schema.Open &&
-			float64((time.Now().Sub(circuit.OpenedAt)).Nanoseconds())*float64(1e-06) > float64(breaker.GracePeriodMs)
+			float64((time.Now().Sub(circuit.OpenedAt)).Nanoseconds())*float64(1e-06) > float64(breaker.gracePeriodMs)
 
 		if moveToHalfOpen {
 			circuit.State = schema.HalfOpen
