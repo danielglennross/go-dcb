@@ -51,8 +51,8 @@ type options struct {
 
 	timeoutMs int64
 
-	backoffMs int64
-	retry     int
+	backoff Backoff
+	retry   int
 
 	logError schema.Log
 	logInfo  schema.Log
@@ -82,9 +82,9 @@ func TimeoutMs(t int64) circuitBreakerOption {
 }
 
 // BackoffMs in milliseconds
-func BackoffMs(b int64) circuitBreakerOption {
+func BackoffMs(b Backoff) circuitBreakerOption {
 	return func(cb *CircuitBreaker) {
-		cb.backoffMs = b
+		cb.backoff = b
 	}
 }
 
@@ -134,7 +134,7 @@ func NewCircuitBreaker(fn interface{}, cache schema.Cache, lock schema.DistLock,
 	cb.gracePeriodMs = 500
 	cb.threshold = 1
 	cb.timeoutMs = 3000
-	cb.backoffMs = 1000
+	cb.backoff = &Fixed{WaitDuration: 300 * time.Millisecond}
 	cb.retry = 3
 
 	cb.circuitChan = make(chan circuitChan)
@@ -297,7 +297,7 @@ func (breaker *CircuitBreaker) trigger(ID string, args []interface{}) (interface
 			if tryCounter == 0 {
 				start = time.After(0)
 			} else {
-				start = time.After(time.Millisecond * time.Duration(breaker.backoffMs))
+				start = time.After(breaker.backoff.Duration())
 			}
 		}
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"time"
 
 	c "github.com/danielglennross/go-dcb/cache"
 )
@@ -37,6 +38,14 @@ func main() {
 		c.TTLms(1000*100),
 	)
 
+	backoff, _ := NewExponential(
+		&ExponentialOptions{
+			Min:    300 * time.Millisecond,
+			Max:    10 * time.Second,
+			Factor: 2,
+		},
+	)
+
 	breaker, err := NewCircuitBreaker(
 		fn,
 		cache,
@@ -44,7 +53,7 @@ func main() {
 		GracePeriodMs(500),
 		Threshold(1),
 		TimeoutMs(1000),
-		BackoffMs(100),
+		BackoffMs(backoff),
 		Retry(3),
 	)
 
