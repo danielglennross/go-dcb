@@ -2,14 +2,32 @@
 
 
 [[projects]]
+  name = "github.com/davecgh/go-spew"
+  packages = ["spew"]
+  revision = "346938d642f2ec3594ed81d874461961cd0faa76"
+  version = "v1.1.0"
+
+[[projects]]
   name = "github.com/go-redis/redis"
   packages = [".","internal","internal/consistenthash","internal/hashtag","internal/pool","internal/proto"]
   revision = "19c1c2272e00c1aaa903cf574c746cd449f9cd3c"
   version = "v6.5.7"
 
+[[projects]]
+  name = "github.com/pmezard/go-difflib"
+  packages = ["difflib"]
+  revision = "792786c7400a136282c1664665ae0a8db921c6c2"
+  version = "v1.0.0"
+
+[[projects]]
+  name = "github.com/stretchr/testify"
+  packages = ["assert","require"]
+  revision = "69483b4bd14f5845b5a1e55bca19e954e827f1d0"
+  version = "v1.1.4"
+
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "15b0e4a11e436766c84a0d6fe175a48b5c23f6746eeec6da0075991220d8b3b5"
+  inputs-digest = "0d3200d05fb4f58e8c33901d9c1394cbe3ef27b3527af584fe4076da99bc582d"
   solver-name = "gps-cdcl"
   solver-version = 1
