@@ -22,8 +22,8 @@ const (
 	`
 )
 
-// ReditCache default memory cache
-type ReditCache struct {
+// RedisCache default memory cache
+type RedisCache struct {
 	logError schema.Log
 	logInfo  schema.Log
 	ttl      int
@@ -92,32 +92,32 @@ func RedLockLogInfo(li schema.Log) redLockOption {
 	}
 }
 
-type reditCacheOption func(*ReditCache)
+type redisCacheOption func(*RedisCache)
 
 // TTL time to live in milliseconds
-func TTL(ttl int) reditCacheOption {
-	return func(rc *ReditCache) {
+func TTL(ttl int) redisCacheOption {
+	return func(rc *RedisCache) {
 		rc.ttl = ttl
 	}
 }
 
 // CacheLogError log error delegate
-func CacheLogError(le schema.Log) reditCacheOption {
-	return func(rc *ReditCache) {
+func CacheLogError(le schema.Log) redisCacheOption {
+	return func(rc *RedisCache) {
 		rc.logError = le
 	}
 }
 
 // CacheLogInfo log info delegate
-func CacheLogInfo(li schema.Log) reditCacheOption {
-	return func(rc *ReditCache) {
+func CacheLogInfo(li schema.Log) redisCacheOption {
+	return func(rc *RedisCache) {
 		rc.logInfo = li
 	}
 }
 
-// NewReditCache ctor
-func NewReditCache(client ClientOption, options ...reditCacheOption) *ReditCache {
-	cache := new(ReditCache)
+// NewRedisCache ctor
+func NewRedisCache(client ClientOption, options ...redisCacheOption) *RedisCache {
+	cache := new(RedisCache)
 	cache.client = redis.NewClient(&redis.Options{
 		Addr:     client.Address,
 		Password: client.Password,
@@ -165,7 +165,7 @@ func NewRedLock(clients []ClientOption, options ...redLockOption) *RedLock {
 }
 
 // Get gets item from cache
-func (cache *ReditCache) Get(ID string) (*schema.Circuit, error) {
+func (cache *RedisCache) Get(ID string) (*schema.Circuit, error) {
 	val, err := cache.client.Get(ID).Result()
 	if err == redis.Nil {
 		return nil, nil
@@ -180,7 +180,7 @@ func (cache *ReditCache) Get(ID string) (*schema.Circuit, error) {
 }
 
 // Set sets item in cache
-func (cache *ReditCache) Set(ID string, circuit *schema.Circuit) error {
+func (cache *RedisCache) Set(ID string, circuit *schema.Circuit) error {
 	cir, err := json.Marshal(circuit)
 	if err != nil {
 		return err

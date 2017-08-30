@@ -15,7 +15,7 @@ func main() {
 
 	// cache := cache.NewMemoryCache()
 
-	cache := c.NewReditCache(
+	cache := c.NewRedisCache(
 		c.ClientOption{
 			Address:  "localhost:6379",
 			Password: "",
