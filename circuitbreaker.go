@@ -263,28 +263,31 @@ func (breaker *CircuitBreaker) Fire(ID string, fn CircuitBreakerFn) (interface{}
 }
 
 // Fire the dynamic breaker
-func (breaker *CircuitBreakerDynamic) Fire(ID string, args ...interface{}) (interface{}, error) {
-	circuit, err := breaker.getOrSetState(ID)
-	if err != nil {
-		return nil, err
+func (dBreaker *CircuitBreakerDynamic) Fire(ID string, args ...interface{}) (interface{}, error) {
+	breaker := dBreaker.CircuitBreaker
+	fnc := dBreaker.fn
+
+	fn := func() (interface{}, error) {
+		var arr []reflect.Value
+		for _, v := range args {
+			arr = append(arr, reflect.ValueOf(v))
+		}
+
+		result := reflect.ValueOf(fnc).Call(arr)
+		r := result[0].Interface()
+		if r != nil {
+			return r, nil
+		}
+
+		e := result[1].Interface()
+		if e != nil {
+			return nil, e.(error)
+		}
+
+		return nil, fmt.Errorf("Could not execute fn with args %v", args)
 	}
 
-	if circuit.State == schema.Closed || circuit.State == schema.HalfOpen {
-		return breaker.trigger(ID, args)
-	}
-
-	reset, err := breaker.tryReset(ID)
-	if err != nil {
-		return nil, err
-	}
-
-	if reset {
-		return breaker.trigger(ID, args)
-	}
-
-	err = fmt.Errorf("circuit open for ID: %s", ID)
-	breaker.fallbackChan <- fallbackChan{ID, err}
-	return nil, err
+	return breaker.Fire(ID, fn)
 }
 
 func (breaker *CircuitBreaker) getOrSetState(ID string) (*schema.Circuit, error) {
@@ -358,127 +361,65 @@ HANDLE:
 	return handler(ID, breaker)
 }
 
-func (breaker *CircuitBreakerDynamic) trigger(ID string, args []interface{}) (interface{}, error) {
-	getTimout := func() <-chan time.Time {
-		return time.After(time.Millisecond * time.Duration(breaker.timeoutMs))
-	}
-
-	makeFn := func() (interface{}, error) {
-		var arr []reflect.Value
-		for _, v := range args {
-			arr = append(arr, reflect.ValueOf(v))
+func handleFail(err error) handler {
+	return wrapSafeHandler(func(ID string, breaker *CircuitBreaker) (interface{}, error) {
+		circuit, cacheErr := breaker.cache.Get(ID)
+		if cacheErr != nil {
+			return nil, cacheErr
 		}
-
-		result := reflect.ValueOf(breaker.fn).Call(arr)
-		r := result[0].Interface()
-		if r != nil {
-			return r, nil
-		}
-
-		e := result[1].Interface()
-		if e != nil {
-			return nil, e.(error)
-		}
-
-		return nil, fmt.Errorf("Could not execute fn with args %v", args)
-	}
-
-	var handler handler
-	var timeout <-chan time.Time
-	var result chan fnResult
-
-	var start <-chan time.Time
-	tryCounter := 0
-
-	for tryCounter < breaker.retry {
-		if result == nil {
-			if tryCounter == 0 {
-				start = time.After(0)
-			} else {
-				start = time.After(breaker.backoff.Duration())
-			}
-		}
-
-		select {
-		case <-timeout:
-			timeout = nil
-			result = nil
-
-			tryCounter++
-			handler = handleFail(fmt.Errorf("A timeout occurred"))
-		case <-start:
-			timeout = getTimout()
-			result = make(chan fnResult, 1)
-
-			go func() {
-				res, err := makeFn()
-				result <- fnResult{res, err}
-			}()
-		case value := <-result:
-			handler = handleSuccess(value)
-			goto HANDLE
-		}
-	}
-
-HANDLE:
-	return handler(ID, breaker.CircuitBreaker)
-}
-
-func handleFail(err error) func(string, *CircuitBreaker) (interface{}, error) {
-	return func(ID string, breaker *CircuitBreaker) (interface{}, error) {
-		return breaker.lock.RunCritical(ID, func() (interface{}, error) {
-			circuit, cacheErr := breaker.cache.Get(ID)
-			if cacheErr != nil {
-				return nil, cacheErr
-			}
-			if circuit == nil {
-				return nil, err
-			}
-			if circuit.State == schema.Open {
-				return nil, err
-			}
-
-			circuit.Failures++
-
-			if circuit.Failures > breaker.threshold {
-				circuit.State = schema.Open
-				circuit.OpenedAt = time.Now()
-
-				breaker.circuitChan <- circuitChan{ID, schema.Open}
-			}
-
-			breaker.fallbackChan <- fallbackChan{ID, err}
-
-			breaker.cache.Set(ID, circuit)
-
+		if circuit == nil {
 			return nil, err
-		})
-	}
+		}
+		if circuit.State == schema.Open {
+			return nil, err
+		}
+
+		circuit.Failures++
+
+		if circuit.Failures > breaker.threshold {
+			circuit.State = schema.Open
+			circuit.OpenedAt = time.Now()
+
+			breaker.circuitChan <- circuitChan{ID, schema.Open}
+		}
+
+		breaker.fallbackChan <- fallbackChan{ID, err}
+
+		breaker.cache.Set(ID, circuit)
+
+		return nil, err
+	})
 }
 
-func handleSuccess(value fnResult) func(string, *CircuitBreaker) (interface{}, error) {
+func handleSuccess(value fnResult) handler {
+	return wrapSafeHandler(func(ID string, breaker *CircuitBreaker) (interface{}, error) {
+		circuit, err := breaker.cache.Get(ID)
+
+		if err != nil {
+			return nil, err
+		}
+		if circuit == nil {
+			return value.res, value.err
+		}
+		if circuit.State == schema.Closed {
+			return value.res, value.err
+		}
+
+		circuit.State = schema.Closed
+		circuit.Failures = 0
+
+		breaker.cache.Set(ID, circuit)
+
+		breaker.circuitChan <- circuitChan{ID, schema.Closed}
+
+		return value.res, value.err
+	})
+}
+
+func wrapSafeHandler(handle handler) handler {
 	return func(ID string, breaker *CircuitBreaker) (interface{}, error) {
 		return breaker.lock.RunCritical(ID, func() (interface{}, error) {
-			circuit, err := breaker.cache.Get(ID)
-
-			if err != nil {
-				return nil, err
-			}
-			if circuit == nil {
-				return value.res, value.err
-			}
-			if circuit.State == schema.Closed {
-				return value.res, value.err
-			}
-
-			circuit.State = schema.Closed
-			circuit.Failures = 0
-
-			breaker.cache.Set(ID, circuit)
-
-			breaker.circuitChan <- circuitChan{ID, schema.Closed}
-
-			return value.res, value.err
+			return handle(ID, breaker)
 		})
 	}
 }
