@@ -8,9 +8,17 @@ import (
 	"github.com/danielglennross/go-dcb/schema"
 )
 
-// Fire circuit breaker contract
-type Fire interface {
-	Fire(ID string, fn interface{}) (interface{}, error)
+// CircuitBreakerFn circuit breaker func
+type CircuitBreakerFn func() (interface{}, error)
+
+// FireDynamic circuit breaker contract
+type FireDynamic interface {
+	Fire(ID string, args ...interface{}) (interface{}, error)
+}
+
+// FireStatic circuit breaker contract
+type FireStatic interface {
+	Fire(ID string, fn CircuitBreakerFn) (interface{}, error)
 }
 
 type handler func(ID string, breaker *CircuitBreaker) (interface{}, error)
@@ -32,7 +40,7 @@ type fallbackChan struct {
 	err error
 }
 
-// CircuitBreaker circuit breaker
+// CircuitBreaker regular
 type CircuitBreaker struct {
 	*options
 	circuitChan                      chan circuitChan
@@ -41,7 +49,12 @@ type CircuitBreaker struct {
 	exit                             chan bool
 	cache                            schema.Cache
 	lock                             schema.DistLock
-	fn                               interface{}
+}
+
+// CircuitBreakerDynamic circuit breaker
+type CircuitBreakerDynamic struct {
+	*CircuitBreaker
+	fn interface{}
 }
 
 // Options circuit breaker options
@@ -109,8 +122,17 @@ func LogInfo(li schema.Log) circuitBreakerOption {
 	}
 }
 
-// NewCircuitBreaker create a new circuit breaker
-func NewCircuitBreaker(fn interface{}, cache schema.Cache, lock schema.DistLock, options ...circuitBreakerOption) (*CircuitBreaker, error) {
+// NewCircuitBreaker ctor
+func NewCircuitBreaker(cache schema.Cache, lock schema.DistLock, options ...circuitBreakerOption) (*CircuitBreaker, error) {
+	cb := new(CircuitBreaker)
+
+	initCircuitBreaker(cb, cache, lock, options...)
+
+	return cb, nil
+}
+
+// NewCircuitBreakerDynamic ctor
+func NewCircuitBreakerDynamic(fn interface{}, cache schema.Cache, lock schema.DistLock, options ...circuitBreakerOption) (*CircuitBreakerDynamic, error) {
 	fnType := reflect.TypeOf(fn)
 
 	if fnType.NumOut() != 2 {
@@ -126,8 +148,22 @@ func NewCircuitBreaker(fn interface{}, cache schema.Cache, lock schema.DistLock,
 		return nil, fmt.Errorf("Invalid function")
 	}
 
-	cb := new(CircuitBreaker)
+	cb := new(CircuitBreakerDynamic)
 	cb.fn = fn
+
+	initCircuitBreaker(cb.CircuitBreaker, cache, lock, options...)
+
+	return cb, nil
+}
+
+// Destroy disposes of the circuit breaker
+func (breaker *CircuitBreaker) Destroy() {
+	close(breaker.exit) // kill go routine
+	close(breaker.circuitChan)
+	close(breaker.fallbackChan)
+}
+
+func initCircuitBreaker(cb *CircuitBreaker, cache schema.Cache, lock schema.DistLock, options ...circuitBreakerOption) {
 	cb.cache = cache
 	cb.lock = lock
 
@@ -155,15 +191,6 @@ func NewCircuitBreaker(fn interface{}, cache schema.Cache, lock schema.DistLock,
 	}
 
 	go handleEvents(cb)
-
-	return cb, nil
-}
-
-// Destroy disposes of the circuit breaker
-func (breaker *CircuitBreaker) Destroy() {
-	close(breaker.exit) // kill go routine
-	close(breaker.circuitChan)
-	close(breaker.fallbackChan)
 }
 
 func handleEvents(breaker *CircuitBreaker) {
@@ -210,8 +237,33 @@ func (breaker *CircuitBreaker) OnFallback(fallback eventHandler) *CircuitBreaker
 	return breaker
 }
 
-// Fire the breaker
-func (breaker *CircuitBreaker) Fire(ID string, args ...interface{}) (interface{}, error) {
+// Fire the static breaker
+func (breaker *CircuitBreaker) Fire(ID string, fn CircuitBreakerFn) (interface{}, error) {
+	circuit, err := breaker.getOrSetState(ID)
+	if err != nil {
+		return nil, err
+	}
+
+	if circuit.State == schema.Closed || circuit.State == schema.HalfOpen {
+		return breaker.trigger(ID, fn)
+	}
+
+	reset, err := breaker.tryReset(ID)
+	if err != nil {
+		return nil, err
+	}
+
+	if reset {
+		return breaker.trigger(ID, fn)
+	}
+
+	err = fmt.Errorf("circuit open for ID: %s", ID)
+	breaker.fallbackChan <- fallbackChan{ID, err}
+	return nil, err
+}
+
+// Fire the dynamic breaker
+func (breaker *CircuitBreakerDynamic) Fire(ID string, args ...interface{}) (interface{}, error) {
 	circuit, err := breaker.getOrSetState(ID)
 	if err != nil {
 		return nil, err
@@ -260,7 +312,53 @@ func (breaker *CircuitBreaker) getOrSetState(ID string) (*schema.Circuit, error)
 	return res.(*schema.Circuit), nil
 }
 
-func (breaker *CircuitBreaker) trigger(ID string, args []interface{}) (interface{}, error) {
+func (breaker *CircuitBreaker) trigger(ID string, fn CircuitBreakerFn) (interface{}, error) {
+	getTimout := func() <-chan time.Time {
+		return time.After(time.Millisecond * time.Duration(breaker.timeoutMs))
+	}
+
+	var handler handler
+	var timeout <-chan time.Time
+	var result chan fnResult
+
+	var start <-chan time.Time
+	tryCounter := 0
+
+	for tryCounter < breaker.retry {
+		if result == nil {
+			if tryCounter == 0 {
+				start = time.After(0)
+			} else {
+				start = time.After(breaker.backoff.Duration())
+			}
+		}
+
+		select {
+		case <-timeout:
+			timeout = nil
+			result = nil
+
+			tryCounter++
+			handler = handleFail(fmt.Errorf("A timeout occurred"))
+		case <-start:
+			timeout = getTimout()
+			result = make(chan fnResult, 1)
+
+			go func() {
+				res, err := fn()
+				result <- fnResult{res, err}
+			}()
+		case value := <-result:
+			handler = handleSuccess(value)
+			goto HANDLE
+		}
+	}
+
+HANDLE:
+	return handler(ID, breaker)
+}
+
+func (breaker *CircuitBreakerDynamic) trigger(ID string, args []interface{}) (interface{}, error) {
 	getTimout := func() <-chan time.Time {
 		return time.After(time.Millisecond * time.Duration(breaker.timeoutMs))
 	}
@@ -323,7 +421,7 @@ func (breaker *CircuitBreaker) trigger(ID string, args []interface{}) (interface
 	}
 
 HANDLE:
-	return handler(ID, breaker)
+	return handler(ID, breaker.CircuitBreaker)
 }
 
 func handleFail(err error) func(string, *CircuitBreaker) (interface{}, error) {

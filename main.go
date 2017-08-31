@@ -46,7 +46,7 @@ func main() {
 		},
 	)
 
-	breaker, err := NewCircuitBreaker(
+	dynamicBreaker, err := NewCircuitBreakerDynamic(
 		fn,
 		cache,
 		lock,
@@ -61,17 +61,51 @@ func main() {
 		fmt.Println(err)
 	}
 
-	breaker.OnClosed(func(ID string) { fmt.Printf("%s", ID) })
-	breaker.OnFallback(func(ID string) { fmt.Printf("%s", ID) })
-	breaker.OnOpen(func(ID string) { fmt.Printf("%s", ID) })
-	breaker.OnHalfOpen(func(ID string) { fmt.Printf("%s", ID) })
+	dynamicBreaker.OnClosed(func(ID string) { fmt.Printf("%s", ID) })
+	dynamicBreaker.OnFallback(func(ID string) { fmt.Printf("%s", ID) })
+	dynamicBreaker.OnOpen(func(ID string) { fmt.Printf("%s", ID) })
+	dynamicBreaker.OnHalfOpen(func(ID string) { fmt.Printf("%s", ID) })
 
-	res, err := breaker.Fire("myFn", "daniel", 2)
+	res1, err := dynamicBreaker.Fire("myFn", "daniel", 2)
 	if err != nil {
 		fmt.Println(err)
 	} else {
-		fmt.Printf("%v", res.(int))
+		fmt.Printf("%v", res1.(int))
 	}
 
-	breaker.Destroy()
+	dynamicBreaker.Destroy()
+
+	// ... //
+
+	staticBreaker, err := NewCircuitBreaker(
+		cache,
+		lock,
+		GracePeriodMs(500),
+		Threshold(1),
+		TimeoutMs(1000),
+		BackoffMs(backoff),
+		Retry(3),
+	)
+
+	if err != nil {
+		fmt.Println(err)
+	}
+
+	staticBreaker.OnClosed(func(ID string) { fmt.Printf("%s", ID) })
+	staticBreaker.OnFallback(func(ID string) { fmt.Printf("%s", ID) })
+	staticBreaker.OnOpen(func(ID string) { fmt.Printf("%s", ID) })
+	staticBreaker.OnHalfOpen(func(ID string) { fmt.Printf("%s", ID) })
+
+	res2, err := staticBreaker.Fire("myFn", func() (interface{}, error) {
+		fmt.Println("Hello World")
+		return 10, nil
+	})
+
+	if err != nil {
+		fmt.Println(err)
+	} else {
+		fmt.Printf("%v", res2.(int))
+	}
+
+	staticBreaker.Destroy()
 }
