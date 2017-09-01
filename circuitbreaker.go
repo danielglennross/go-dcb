@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/danielglennross/go-dcb/policies"
 	"github.com/danielglennross/go-dcb/schema"
 )
 
@@ -64,7 +65,7 @@ type options struct {
 
 	timeoutMs int64
 
-	backoff Backoff
+	backoff policies.Backoff
 	retry   int
 
 	logError schema.Log
@@ -95,7 +96,7 @@ func TimeoutMs(t int64) circuitBreakerOption {
 }
 
 // BackoffMs in milliseconds
-func BackoffMs(b Backoff) circuitBreakerOption {
+func BackoffMs(b policies.Backoff) circuitBreakerOption {
 	return func(cb *CircuitBreaker) {
 		cb.backoff = b
 	}
@@ -170,7 +171,7 @@ func initCircuitBreaker(cb *CircuitBreaker, cache schema.Cache, lock schema.Dist
 	cb.gracePeriodMs = 500
 	cb.threshold = 1
 	cb.timeoutMs = 3000
-	cb.backoff = &Fixed{WaitDuration: 300 * time.Millisecond}
+	cb.backoff = &policies.Fixed{WaitDuration: 300 * time.Millisecond}
 	cb.retry = 3
 
 	cb.circuitChan = make(chan circuitChan)
