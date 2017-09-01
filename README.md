@@ -35,12 +35,10 @@ lock := c.NewRedLock(
   c.TTLms(1000*100),
 )
 
-backoff, _ := NewExponential(
-  &ExponentialOptions{
-    Min:    300 * time.Millisecond,
-    Max:    10 * time.Second,
-    Factor: 2,
-  },
+backoff, _ := policies.NewExponential(
+  policies.Min(300*time.Millisecond),
+  policies.Max(10*time.Second),
+  policies.Factor(2),
 )
 
 breaker, _ := NewCircuitBreaker(
