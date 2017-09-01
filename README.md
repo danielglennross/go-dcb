@@ -2,15 +2,12 @@
 A distributed circuit breaker implemented in Go.
 
 # example
-A distributed circuit breaker using a Redis cache & Redlock sync mechanism.
+A distributed circuit breaker(s) using a Redis cache & Redlock sync mechanism.
+
+Creating a distributed cache & lock strategy:
 
 ```go
 // ignoring errors for purpose of example
-
-fn := func(name string) (string, error) {
-  msg := fmt.Sprintf("%s, Hello World", name)
-  return msg, nil
-}
 
 cache := c.NewRedisCache(
   c.ClientOption{
@@ -34,14 +31,65 @@ lock := c.NewRedLock(
   c.DriftFactor(0.01),
   c.TTLms(1000*100),
 )
+```
+
+Setting circuit breaker policies:
+
+```go
+// ignoring errors for purpose of example
 
 backoff, _ := policies.NewExponential(
   policies.Min(300*time.Millisecond),
   policies.Max(10*time.Second),
   policies.Factor(2),
 )
+```
 
-breaker, _ := NewCircuitBreaker(
+Creating a circuit breaker:
+
+A circuit breaker is initialised with a cache & lock strategy, as well as various configuration options.
+
+The circuit breaker is fired with an ID and function matching the signature: `func() (interface{}, error)`.
+
+```go
+// ignoring errors for purpose of example
+
+breaker, err := NewCircuitBreaker(
+  cache,
+  lock,
+  GracePeriodMs(500),
+  Threshold(1),
+  TimeoutMs(1000),
+  BackoffMs(backoff),
+  Retry(3),
+)
+
+res, _ := breaker.Fire("myFnId", func() (interface{}, error) {
+  return "Daniel, Hello World"
+})
+fmt.Printf("%v", res.(string))
+
+breaker.Destroy()
+```
+
+Creating a dynamic circuit breaker:
+
+A dynamic circuit breaker is initialised with a function, a cache & lock strategy, as well as various configuration options.
+
+The wrapped function can have any number of input paramter types (including none).
+However, it must return two types that can be respectfully cast to `(interface{}, error)`.
+
+The dynamic circuit breaker is fired with an ID and a spread of all the arguments required by the wrapped function.
+
+```go
+// ignoring errors for purpose of example
+
+fn := func(name string) (string, error) {
+  msg := fmt.Sprintf("%s, Hello World", name)
+  return msg, nil
+}
+
+breaker, _ := NewCircuitBreakerDynamic(
   fn,
   cache,
   lock,
@@ -52,13 +100,17 @@ breaker, _ := NewCircuitBreaker(
   Retry(3),
 )
 
+res, _ := breaker.Fire("myFnId", "Daniel")
+fmt.Printf("%v", res.(string))
+
+breaker.Destroy()
+```
+
+Handling circuit breaker events:
+
+```go
 breaker.OnClosed(func(ID string) { fmt.Printf("%s", ID) })
 breaker.OnFallback(func(ID string) { fmt.Printf("%s", ID) })
 breaker.OnOpen(func(ID string) { fmt.Printf("%s", ID) })
 breaker.OnHalfOpen(func(ID string) { fmt.Printf("%s", ID) })
-
-res, _ := breaker.Fire("myFnId", "daniel")
-fmt.Printf("%v", res.(string))
-
-breaker.Destroy()
 ```
