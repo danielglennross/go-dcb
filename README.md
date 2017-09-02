@@ -57,6 +57,9 @@ The circuit breaker is fired with an ID and function matching the signature: `fu
 breaker, err := NewCircuitBreaker(
   cache,
   lock,
+  FailCondition(func(err error) bool {
+    ...
+  }),
   GracePeriodMs(500),
   Threshold(1),
   TimeoutMs(1000),
@@ -93,6 +96,9 @@ breaker, _ := NewCircuitBreakerDynamic(
   fn,
   cache,
   lock,
+  FailCondition(func(err error) bool {
+    ...
+  }),
   GracePeriodMs(500),
   Threshold(1),
   TimeoutMs(1000),
@@ -113,4 +119,17 @@ breaker.OnClosed(func(ID string) { fmt.Printf("%s", ID) })
 breaker.OnFallback(func(ID string) { fmt.Printf("%s", ID) })
 breaker.OnOpen(func(ID string) { fmt.Printf("%s", ID) })
 breaker.OnHalfOpen(func(ID string) { fmt.Printf("%s", ID) })
+```
+
+Manually controlling the circuit breaker:
+
+Isolate:
+Manually open (and hold open) a circuit breaker - for example to manually isolate a downstream service.
+
+Reset:
+Reset the breaker to closed state, to start accepting actions again.
+
+```go
+ok := breaker.Isolate()
+ok = breaker.Reset()
 ```

@@ -6,6 +6,7 @@ const (
 	Closed State = iota
 	Open
 	HalfOpen
+	Isolate
 )
 
 // State circuit state

@@ -49,6 +49,9 @@ func main() {
 		fn,
 		cache,
 		lock,
+		FailCondition(func(err error) bool {
+			return err != nil
+		}),
 		GracePeriodMs(500),
 		Threshold(1),
 		TimeoutMs(1000),
@@ -72,6 +75,8 @@ func main() {
 		fmt.Printf("%v", res1.(int))
 	}
 
+	_ = dynamicBreaker.Isolate("myFn")
+	_ = dynamicBreaker.Reset("myFn")
 	dynamicBreaker.Destroy()
 
 	// ... //
@@ -79,6 +84,9 @@ func main() {
 	staticBreaker, err := NewCircuitBreaker(
 		cache,
 		lock,
+		FailCondition(func(err error) bool {
+			return err != nil
+		}),
 		GracePeriodMs(500),
 		Threshold(1),
 		TimeoutMs(1000),
@@ -106,5 +114,7 @@ func main() {
 		fmt.Printf("%v", res2.(int))
 	}
 
+	_ = staticBreaker.Isolate("myFn")
+	_ = staticBreaker.Reset("myFn")
 	staticBreaker.Destroy()
 }

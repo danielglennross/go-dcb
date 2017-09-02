@@ -41,6 +41,8 @@ type fallbackChan struct {
 	err error
 }
 
+type failCondition func(err error) bool
+
 // CircuitBreaker regular
 type CircuitBreaker struct {
 	*options
@@ -65,14 +67,22 @@ type options struct {
 
 	timeoutMs int64
 
-	backoff policies.Backoff
-	retry   int
+	failCondition failCondition
+	backoff       policies.Backoff
+	retry         int
 
 	logError schema.Log
 	logInfo  schema.Log
 }
 
 type circuitBreakerOption func(*CircuitBreaker)
+
+// FailCondition condition which to fail the circuit breaker
+func FailCondition(failCondition failCondition) circuitBreakerOption {
+	return func(cb *CircuitBreaker) {
+		cb.failCondition = failCondition
+	}
+}
 
 // GracePeriodMs grace period in milliseconds
 func GracePeriodMs(gp int64) circuitBreakerOption {
@@ -164,6 +174,27 @@ func (breaker *CircuitBreaker) Destroy() {
 	close(breaker.fallbackChan)
 }
 
+// Isolate manually open (and hold open) a circuit breaker
+func (breaker *CircuitBreaker) Isolate(ID string) bool {
+	return breaker.safelyUpdateCircuit(ID, func(circuit *schema.Circuit) {
+		circuit.State = schema.Isolate
+
+		breaker.circuitChan <- circuitChan{ID, schema.Open}
+		breaker.fallbackChan <- fallbackChan{ID, fmt.Errorf("Ioslating ID %s", ID)}
+	})
+}
+
+// Reset resets a circuit to closed
+func (breaker *CircuitBreaker) Reset(ID string) bool {
+	return breaker.safelyUpdateCircuit(ID, func(circuit *schema.Circuit) {
+		circuit.State = schema.Closed
+		circuit.OpenedAt = time.Time{}
+		circuit.Failures = 0
+
+		breaker.circuitChan <- circuitChan{ID, schema.Closed}
+	})
+}
+
 func initCircuitBreaker(cb *CircuitBreaker, cache schema.Cache, lock schema.DistLock, options ...circuitBreakerOption) {
 	cb.cache = cache
 	cb.lock = lock
@@ -171,6 +202,8 @@ func initCircuitBreaker(cb *CircuitBreaker, cache schema.Cache, lock schema.Dist
 	cb.gracePeriodMs = 500
 	cb.threshold = 1
 	cb.timeoutMs = 3000
+
+	cb.failCondition = func(err error) bool { return true }
 	cb.backoff = &policies.Fixed{WaitDuration: 300 * time.Millisecond}
 	cb.retry = 3
 
@@ -192,6 +225,27 @@ func initCircuitBreaker(cb *CircuitBreaker, cache schema.Cache, lock schema.Dist
 	}
 
 	go handleEvents(cb)
+}
+
+func (breaker *CircuitBreaker) safelyUpdateCircuit(ID string, fn func(circuit *schema.Circuit)) bool {
+	res, err := breaker.lock.RunCritical(ID, func() (interface{}, error) {
+		circuit, err := breaker.cache.Get(ID)
+		if err != nil {
+			return false, nil
+		}
+
+		fn(circuit)
+
+		err = breaker.cache.Set(ID, circuit)
+		if err != nil {
+			return false, nil
+		}
+		return true, nil
+	})
+	if err != nil {
+		return false
+	}
+	return res.(bool)
 }
 
 func handleEvents(breaker *CircuitBreaker) {
@@ -245,22 +299,29 @@ func (breaker *CircuitBreaker) Fire(ID string, fn CircuitBreakerFn) (interface{}
 		return nil, err
 	}
 
-	if circuit.State == schema.Closed || circuit.State == schema.HalfOpen {
-		return breaker.trigger(ID, fn)
-	}
-
-	reset, err := breaker.tryReset(ID)
-	if err != nil {
+	handleOpen := func() (interface{}, error) {
+		err = fmt.Errorf("circuit open for ID: %s", ID)
+		breaker.fallbackChan <- fallbackChan{ID, err}
 		return nil, err
 	}
 
-	if reset {
-		return breaker.trigger(ID, fn)
+	if circuit.State == schema.Isolate {
+		return handleOpen()
 	}
 
-	err = fmt.Errorf("circuit open for ID: %s", ID)
-	breaker.fallbackChan <- fallbackChan{ID, err}
-	return nil, err
+	if circuit.State == schema.Open {
+		reset, err := breaker.tryReset(ID)
+		if err != nil {
+			return nil, err
+		}
+
+		if !reset {
+			return handleOpen()
+		}
+	}
+
+	// Closed || HalfOpen
+	return breaker.trigger(ID, fn)
 }
 
 // Fire the dynamic breaker
@@ -349,11 +410,23 @@ func (breaker *CircuitBreaker) trigger(ID string, fn CircuitBreakerFn) (interfac
 			result = make(chan fnResult, 1)
 
 			go func() {
+				defer func() {
+					e := recover()
+					if e != nil {
+						_, _ = handleFail(fmt.Errorf("A panic occurred"))(ID, breaker)
+						panic(e)
+					}
+				}()
+
 				res, err := fn()
 				result <- fnResult{res, err}
 			}()
 		case value := <-result:
-			handler = handleSuccess(value)
+			if value.err != nil && breaker.failCondition(value.err) {
+				handler = handleFail(value.err)
+			} else {
+				handler = handleSuccess(value.res)
+			}
 			goto HANDLE
 		}
 	}
@@ -392,18 +465,17 @@ func handleFail(err error) handler {
 	})
 }
 
-func handleSuccess(value fnResult) handler {
+func handleSuccess(value interface{}) handler {
 	return wrapSafeHandler(func(ID string, breaker *CircuitBreaker) (interface{}, error) {
-		circuit, err := breaker.cache.Get(ID)
-
-		if err != nil {
-			return nil, err
+		circuit, cacheErr := breaker.cache.Get(ID)
+		if cacheErr != nil {
+			return nil, cacheErr
 		}
 		if circuit == nil {
-			return value.res, value.err
+			return value, nil
 		}
 		if circuit.State == schema.Closed {
-			return value.res, value.err
+			return value, nil
 		}
 
 		circuit.State = schema.Closed
@@ -413,7 +485,7 @@ func handleSuccess(value fnResult) handler {
 
 		breaker.circuitChan <- circuitChan{ID, schema.Closed}
 
-		return value.res, value.err
+		return value, nil
 	})
 }
 
