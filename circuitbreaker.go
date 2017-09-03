@@ -422,16 +422,22 @@ func (breaker *CircuitBreaker) trigger(ID string, fn CircuitBreakerFn) (interfac
 				result <- fnResult{res, err}
 			}()
 		case value := <-result:
-			if value.err != nil && breaker.failCondition(value.err) {
-				handler = handleFail(value.err)
-			} else {
+			if value.err == nil {
 				handler = handleSuccess(value.res)
+				break
 			}
-			goto HANDLE
+
+			if !breaker.failCondition(value.err) {
+				return nil, value.err
+			}
+
+			timeout = nil
+			result = nil
+			tryCounter++
+			handler = handleFail(value.err)
 		}
 	}
 
-HANDLE:
 	return handler(ID, breaker)
 }
 
